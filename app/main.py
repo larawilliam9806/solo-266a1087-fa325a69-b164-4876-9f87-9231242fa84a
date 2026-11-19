@@ -1,25 +1,36 @@
-"""FastAPI 入口：版本化发布、整批替换、同版一致性查询。
+"""FastAPI 入口：版本化发布、整批替换、同版一致性查询、污染覆盖分析。
 
 并发与原子性：
 - 重活（几何核查、井归属重算）在写事务之外基于 base 版本快照完成；
 - 写事务用 BEGIN IMMEDIATE 串行化，进入后先核对 meta.current_revision
   仍等于 base_revision，不等则回滚返回 409 —— 同版并发修订只成功一份；
 - 版本行、宗地行、井归属行、版本指针在同一个事务里提交，失败/重启不留半版。
+- 污染覆盖分析同样基于快照计算，提交时复核修订号：过期请求返回 409 且
+  不落任何报告；已完成报告不可变，边界更新后仍按原值回查。
 """
 from __future__ import annotations
 
 import json
 import sqlite3
+import math
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from .db import connect, init_db
-from .geo import attribute_wells, parse_point, parse_polygon, validate_tiling
-from .schemas import InitRequest, ReplaceRequest
+from .geo import (
+    attribute_wells,
+    compute_coverage,
+    parse_point,
+    parse_polygon,
+    validate_tiling,
+)
+from .schemas import CoverageAnalysisRequest, InitRequest, ReplaceRequest
 
 
 @asynccontextmanager
@@ -33,6 +44,33 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+
+def _sanitize_json(value: Any) -> Any:
+    """把非有限浮点（NaN/Infinity）及其余不可 JSON 序列化对象转为可编码形式。"""
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "NaN"
+        if math.isinf(value):
+            return "Infinity" if value > 0 else "-Infinity"
+        return value
+    if isinstance(value, dict):
+        return {k: _sanitize_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_json(v) for v in value]
+    if isinstance(value, (str, int, bool)) or value is None:
+        return value
+    # Pydantic v2 的 ctx 里可能内嵌异常等对象
+    return str(value)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    # 默认 422 契约会回显输入；非有限浮点无法被严格 JSON 编码，先清洗再返回。
+    return JSONResponse(
+        status_code=422,
+        content={"detail": _sanitize_json(exc.errors())},
+    )
 
 
 # ---------------------------------------------------------------- 工具
@@ -434,6 +472,141 @@ def get_revision(revision: int):
         "parcels": [{"id": pid, "geometry": parcels[pid]} for pid in sorted(parcels)],
         "wells": _wells_payload(well_gj, attributions),
     }
+
+
+# ---------------------------------------------------------------- 污染覆盖分析
+
+def _coverage_conflict(base_revision: int, current: int) -> JSONResponse:
+    return _err(409, {
+        "error": "revision_conflict",
+        "message": f"分析请求基于修订号 {base_revision}，当前边界已更新到 "
+                   f"{current}，请求过期，未生成报告，请基于新版重试",
+        "current_revision": current,
+        "base_revision": base_revision,
+    })
+
+
+@app.post("/v1/coverage/analyze", status_code=201)
+def analyze_coverage(req: CoverageAnalysisRequest):
+    """提交污染覆盖分析：按井位圆形范围拆分每块宗地的超限/达标/未采样面积。
+
+    - 未知井号（或请求内井号重复）整批 422 拒绝，不落报告；
+    - base_revision 与当前边界修订号不一致 → 409，不留报告；
+    - 输入、修订号与结果在同一事务落库，返回 report_id 供回查；
+    - 已完成报告不可变，之后边界更新不影响历史报告。
+    """
+    # 1) 快照读取当前边界与井位（读事务，不阻塞写者）
+    conn = connect()
+    try:
+        current = _current_revision(conn)
+        if current is None:
+            return _err(404, {"error": "not_initialized",
+                              "message": "尚未首次提交，请先调用 POST /v1/init"})
+        if req.base_revision != current:
+            return _coverage_conflict(req.base_revision, current)
+        region_gj = _load_region(conn)
+        parcel_gj = _load_parcels(conn, current)
+        well_gj = _load_well_geoms(conn)
+    finally:
+        conn.close()
+
+    # 2) 语义校验：井号唯一、必须全部已知，否则整批拒绝
+    reasons: list[dict] = []
+    seen: set[str] = set()
+    samples: list[tuple[str, float]] = []
+    for s in req.samples:
+        if s.well_id in seen:
+            reasons.append({"code": "duplicate_well_id", "well_id": s.well_id,
+                            "message": f"井编号 {s.well_id} 在分析请求中重复"})
+            continue
+        seen.add(s.well_id)
+        if s.well_id not in well_gj:
+            reasons.append({"code": "unknown_well_id", "well_id": s.well_id,
+                            "message": f"井 {s.well_id} 不存在，分析请求整批拒绝"})
+            continue
+        samples.append((s.well_id, s.concentration))
+    if reasons:
+        return _err(422, {
+            "error": "validation_failed",
+            "message": "分析请求未通过校验，未生成报告",
+            "reasons": reasons,
+            "unknown_well_ids": sorted(
+                {r["well_id"] for r in reasons if r["code"] == "unknown_well_id"}),
+        })
+
+    # 3) 解析几何并基于快照计算覆盖面积（重活在写事务外完成）
+    region_geom, _ = parse_polygon(region_gj, label="区域")
+    parcel_geoms: dict[str, Any] = {}
+    for pid, gj in parcel_gj.items():
+        geom, _ = parse_polygon(gj, parcel_id=pid, label=f"宗地 {pid}")
+        parcel_geoms[pid] = geom
+    well_points: dict[str, Any] = {}
+    for wid, gj in well_gj.items():
+        pt, _ = parse_point(gj, well_id=wid, label=f"井 {wid}")
+        well_points[wid] = pt
+
+    coverage = compute_coverage(
+        parcels=parcel_geoms, region=region_geom, well_points=well_points,
+        samples=samples, radius=req.radius, limit=req.limit,
+    )
+
+    # 4) 乐观并发提交：计算期间若边界已更新，拒绝且不留报告
+    report_id = uuid.uuid4().hex
+    payload = {
+        "report_id": report_id,
+        "base_revision": req.base_revision,
+        "radius": req.radius,
+        "limit": req.limit,
+        "samples": [{"well_id": wid, "concentration": conc}
+                    for wid, conc in samples],
+        "created_at": _now(),
+        **coverage,
+    }
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            current_now = _current_revision(conn)
+            if current_now != req.base_revision:
+                conn.execute("ROLLBACK")
+                return _coverage_conflict(req.base_revision, current_now)
+            conn.execute(
+                "INSERT INTO coverage_reports "
+                "(report_id, base_revision, radius, limit_value, payload, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (report_id, req.base_revision, req.radius, req.limit,
+                 json.dumps(payload), payload["created_at"]),
+            )
+            conn.executemany(
+                "INSERT INTO coverage_samples (report_id, well_id, concentration) "
+                "VALUES (?, ?, ?)",
+                [(report_id, wid, conc) for wid, conc in samples],
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.close()
+
+    return payload
+
+
+@app.get("/v1/coverage/reports/{report_id}")
+def get_coverage_report(report_id: str):
+    """按报告 ID 回查：返回保存的输入、修订号与原始计算结果（永不被后续修订改写）。"""
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT payload FROM coverage_reports WHERE report_id = ?",
+            (report_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return _err(404, {"error": "report_not_found",
+                          "message": f"覆盖分析报告 {report_id} 不存在"})
+    return json.loads(row[0])
 
 
 @app.get("/healthz")

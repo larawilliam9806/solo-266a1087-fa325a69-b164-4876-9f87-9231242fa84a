@@ -56,6 +56,24 @@ CREATE TABLE IF NOT EXISTS well_attributions (
     candidates TEXT NOT NULL DEFAULT '[]',
     PRIMARY KEY (revision, well_id)
 );
+
+-- 污染覆盖分析报告：输入、修订号与结果在同一事务落库，之后不可变。
+-- base_revision 记录报告所基于的边界版本；边界再修订后报告保持原值可查。
+CREATE TABLE IF NOT EXISTS coverage_reports (
+    report_id     TEXT PRIMARY KEY,
+    base_revision INTEGER NOT NULL REFERENCES versions(revision),
+    radius        REAL NOT NULL,
+    limit_value   REAL NOT NULL,
+    payload       TEXT NOT NULL,
+    created_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS coverage_samples (
+    report_id     TEXT NOT NULL REFERENCES coverage_reports(report_id),
+    well_id       TEXT NOT NULL REFERENCES wells(well_id),
+    concentration REAL NOT NULL,
+    PRIMARY KEY (report_id, well_id)
+);
 """
 
 

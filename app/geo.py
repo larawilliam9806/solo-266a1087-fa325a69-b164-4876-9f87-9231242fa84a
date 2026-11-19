@@ -210,3 +210,92 @@ def attribute_wells(wells: dict[str, Point],
             result[wid] = {"status": "uncovered", "parcel_id": None,
                            "candidates": []}
     return result
+
+
+# ---------------------------------------------------------------- 污染覆盖分析
+
+ROUND_DIGITS = 6
+
+
+def _safe_union(geoms: list):
+    """空列表返回空几何；否则求并集（同类重叠只计一次）。"""
+    if not geoms:
+        return Polygon()  # 空多边形，area == 0
+    return unary_union(geoms)
+
+
+def compute_coverage(*, parcels: dict[str, Polygon], region: Polygon,
+                     well_points: dict[str, Point],
+                     samples: list[tuple[str, float]], radius: float,
+                     limit: float) -> dict:
+    """按井位圆形覆盖范围计算每块宗地的超限/仅达标/未采样面积。
+
+    规则：
+    - 每口采样井以井位为圆心、radius 为半径生成圆形范围（与坐标同单位）；
+      区域外（圆与区域完全不沾）的井不贡献任何面积。
+    - 浓度严格大于限值才超限；等于限值算达标。未采样井不生成圆，不视为达标。
+    - 超限圆并集与达标圆并集求交，达标圆被超限圆覆盖的部分从达标面积中剔除
+      （超限与达标范围重叠时超限优先）；同类圆重叠通过并集天然只计一次。
+    - 落在宗地共边上的圆与两侧宗地分别求交，共边两侧都计入。
+    - 三类面积之和等于宗地面积（先各算后按 1e-6 四舍五入，舍入残差并入
+      未采样面积，保证 JSON 输出中三者之和恰等于宗地面积）。
+    """
+    exceed_circles: list = []
+    comply_circles: list = []
+    included: list[str] = []
+    excluded: list[str] = []
+
+    for well_id, concentration in samples:
+        point_geom = well_points[well_id]
+        if not region.intersects(point_geom):
+            # 井在区域外：其圆形范围不贡献面积（共边井 region.intersects 为真，保留）
+            excluded.append(well_id)
+            continue
+        circle = point_geom.buffer(radius, quad_segs=64)
+        included.append(well_id)
+        if concentration > limit:
+            exceed_circles.append(circle)
+        else:
+            comply_circles.append(circle)
+
+    exceed_union = _safe_union(exceed_circles)
+    comply_union = _safe_union(comply_circles)
+    # 达标范围中被超限范围盖住的部分让给超限（超限优先）
+    comply_only = comply_union.difference(exceed_union)
+
+    parcel_results: list[dict] = []
+    for pid in sorted(parcels):
+        geom = parcels[pid]
+        parcel_area = geom.area
+        exceed_area = geom.intersection(exceed_union).area
+        comply_area = geom.intersection(comply_only).area
+        unsampled_area = parcel_area - exceed_area - comply_area
+        if abs(unsampled_area) < AREA_TOL:
+            unsampled_area = 0.0
+
+        exceed_r = round(exceed_area, ROUND_DIGITS)
+        comply_r = round(comply_area, ROUND_DIGITS)
+        parcel_r = round(parcel_area, ROUND_DIGITS)
+        # 舍入残差并入未采样面积，保证三类之和严格等于宗地面积
+        unsampled_r = round(parcel_r - exceed_r - comply_r, ROUND_DIGITS)
+
+        parcel_results.append({
+            "parcel_id": pid,
+            "area": parcel_r,
+            "exceed_area": exceed_r,
+            "compliant_area": comply_r,
+            "unsampled_area": unsampled_r,
+        })
+
+    totals = {
+        "area": round(sum(r["area"] for r in parcel_results), ROUND_DIGITS),
+        "exceed_area": round(sum(r["exceed_area"] for r in parcel_results), ROUND_DIGITS),
+        "compliant_area": round(sum(r["compliant_area"] for r in parcel_results), ROUND_DIGITS),
+        "unsampled_area": round(sum(r["unsampled_area"] for r in parcel_results), ROUND_DIGITS),
+    }
+    return {
+        "parcels": parcel_results,
+        "totals": totals,
+        "included_wells": included,
+        "excluded_wells": excluded,
+    }

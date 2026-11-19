@@ -48,6 +48,8 @@ pytest                 # 运行测试
 | `GET` | `/v1/wells` | 当前井归属（响应带 `revision`，可与边界响应对号验证同版） |
 | `GET` | `/v1/revisions` | 版本列表 |
 | `GET` | `/v1/revisions/{n}` | 读取指定历史版本 |
+| `POST` | `/v1/coverage/analyze` | 污染覆盖分析：圆形覆盖范围拆分每块宗地的超限/达标/未采样面积 |
+| `GET` | `/v1/coverage/reports/{id}` | 按报告 ID 回查保存的输入、修订号与结果 |
 | `GET` | `/healthz` | 健康检查 |
 
 ### 首次提交
@@ -114,6 +116,60 @@ curl -X PUT http://localhost:8000/v1/parcels -H 'Content-Type: application/json'
 `base_revision` 与当前版本不一致（含提交期间被他人抢先发布）时返回 409，
 响应携带当前修订号，客户端重新读取后可基于新版重试。
 
+## 污染覆盖分析（采样复查）
+
+`POST /v1/coverage/analyze` 提交一次分析请求：
+
+| 字段 | 规则 |
+|---|---|
+| `base_revision` | 所见边界修订号；与当前修订号不一致 → 409，**拒绝且不留报告** |
+| `radius` | 井位圆形覆盖半径，与坐标同单位，**有限正数** |
+| `limit` | 浓度限值，**有限非负数**；浓度严格大于限值才算超限（等于算达标） |
+| `samples` | 至多 100 条，井号唯一；每条 `{well_id, concentration}`，浓度有限非负 |
+
+- **未知井号或井号重复 → 422 整批拒绝**，不生成任何报告；未采样的井不生成
+  覆盖圆，其所在面积计入未采样（**不视为达标**）。
+- 每口采样井以井位为圆心生成圆形范围：
+  - **超限优先**：超限圆与达标圆重叠的部分计入超限，达标只保留差集；
+  - **同类重叠只计一次**：同类多口井的圆先求并集；
+  - **区域外井不贡献**：井位不沾区域时整圆忽略（响应 `excluded_wells` 列出），
+    圆伸出区域边界的部分自动裁掉；
+  - **共边井覆盖两侧**：圆与共边两侧宗地分别求交。
+- 每块宗地输出 `exceed_area` / `compliant_area` / `unsampled_area`，
+  **三者之和严格等于宗地 `area`**（面积按 1e-6 四舍五入，舍入残差并入未采样面积），
+  响应另附全区域 `totals` 汇总。
+- 输入、修订号与结果在同一事务落库并返回 `report_id`；报告不可变，
+  之后边界再修订，`GET /v1/coverage/reports/{id}` 仍返回原值。
+
+```bash
+curl -X POST http://localhost:8000/v1/coverage/analyze -H 'Content-Type: application/json' -d '{
+  "base_revision": 1,
+  "radius": 10.0,
+  "limit": 5.0,
+  "samples": [
+    {"well_id": "W1", "concentration": 8.2},
+    {"well_id": "W2", "concentration": 1.0}
+  ]
+}'
+# => 201
+# {
+#   "report_id": "75b849578d8341829e252f096b7c6823",
+#   "base_revision": 1, "radius": 10.0, "limit": 5.0,
+#   "samples": [...], "created_at": "...",
+#   "parcels": [
+#     {"parcel_id":"P1","area":5000.0,
+#      "exceed_area":314.159265,"compliant_area":0.0,"unsampled_area":4685.840735},
+#     ...
+#   ],
+#   "totals": {"area":10000.0, ...},
+#   "included_wells": ["W1","W2"],
+#   "excluded_wells": []
+# }
+```
+
+边界在分析期间被抢先发布时，提交事务内复核修订号失败 → 409 且不留报告；
+已完成的历史报告不受影响，仍按原值回查。
+
 ## 并发与原子性设计
 
 - **同版并发修订只成功一份**：几何核查与井归属重算在写事务外基于快照完成；
@@ -131,10 +187,11 @@ curl -X PUT http://localhost:8000/v1/parcels -H 'Content-Type: application/json'
 
 ```
 app/
-  main.py      # FastAPI 入口与端点
-  geo.py       # 几何校验、覆盖核查、井归属计算（Shapely）
-  db.py        # SQLite 连接、建表、启动清理
+  main.py      # FastAPI 入口与端点（版本发布、井归属、污染覆盖分析）
+  geo.py       # 几何校验、覆盖核查、井归属、污染覆盖面积计算（Shapely）
+  db.py        # SQLite 连接、建表（含覆盖分析报告表）、启动清理
   schemas.py   # 请求模型（Pydantic）
 tests/test_api.py
+tests/test_coverage.py
 Dockerfile / docker-compose.yml
 ```
